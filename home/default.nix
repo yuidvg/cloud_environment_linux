@@ -1,7 +1,7 @@
 # クラウド環境（root）の home-manager 設定。
 # 編集して push → 環境のキャッシュが作り直されたあとの新しいセッションから反映（README「パッケージや環境変数を追加する」参照）。
 # 秘密情報はここに書かない（公開リポジトリ）。API キーなどはクラウド環境の設定側で渡す。
-{ config, pkgs, ... }:
+{ config, pkgs, inputs, ... }:
 {
   home.username = "root";
   home.homeDirectory = "/root";
@@ -15,11 +15,16 @@
     just
     ripgrep
     jq
+    # 購入調査の CLI（github:yuidvg/meguri）
+    inputs.meguri.packages.${pkgs.stdenv.hostPlatform.system}.default
   ];
 
   # 環境変数（bash -lc / bash -ic の両方で見える）
   home.sessionVariables = {
     EDITOR = "vim";
+    # 既定のロケールが POSIX だと、日本語の引数や出力が化ける（meguri の検索語など）。
+    # C.UTF-8 は glibc に組み込みなので、ロケールのデータを足さなくても使える。
+    LANG = "C.UTF-8";
     # scripts/check.sh が sessionVariables の反映確認に使う目印
     CLOUD_ENV_LINUX = "1";
   };
