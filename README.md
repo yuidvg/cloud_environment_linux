@@ -18,8 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main
 
 | 段階 | 内容 | 目安 |
 | --- | --- | --- |
-| 1. shim setup | `api.github.com` のローカル shim、CA バンドル、`/root/.local/bin/nix` ラッパー | 数秒 |
-| 2. nix install | [NixOS/nix-installer](https://github.com/NixOS/nix-installer)（`install linux --init none`） | 約 30 秒 |
+| 1. shim setup | `api.github.com` のローカル shim、CA バンドル、`/root/.local/bin/nix` ラッパー（と `nix-build` などのリンク）、`/etc/profile.d/zz-gh-shim.sh` | 数秒 |
+| 2. nix install | [NixOS/nix-installer](https://github.com/NixOS/nix-installer)（`install linux --init none`）。ベースイメージに nix が入っていればスキップ。どちらの場合も最後に `nix.conf` へ shim の設定を足す | 約 30 秒 |
 | 3. home-manager setup | `nix run github:yuidvg/cloud_environment_linux#home-manager -- switch --flake github:yuidvg/cloud_environment_linux#root -b bak` | 約 70 秒 |
 
 shim を先に用意するのは、nix-installer に `--ssl-cert-file /etc/nix/ca-bundle.pem` を渡すため（インストーラーはこのファイルが存在しないと失敗する）。
@@ -80,18 +80,23 @@ api.github.com  ──/etc/hosts──▶  127.0.0.1:443  (shim/shim.py)
 - `shim/shim.py` は `127.0.0.1:443` で `api.github.com` のふりをする。真似するのは次の 2 つだけ。
   - `GET /repos/{o}/{r}/commits/{ref}` → ref を commit に解決して `sha` / `tree` / 日付を返す
   - `GET /repos/{o}/{r}/tarball/{rev}` → `git archive` の tar.gz を返す
-- Nix は `access-tokens` にトークンがあるときだけ `api.github.com/.../tarball/...` を使う（ないと `github.com/.../archive/...` に行ってしまう）。そこで `nix.conf` にダミーのトークン `github.com=gh-shim-dummy` を入れている。shim はトークンの中身を見ない。
-- shim の自己署名 CA は **Nix だけが信頼する**（`/etc/nix/ca-bundle.pem` = システム CA + shim CA）。システムの信頼ストアには入れない。
-- `/root/.local/bin/nix`（`shim/nix-wrapper.sh`）は実行のたびに `/opt/gh-shim/ensure.sh` を呼び、次を直してから本物の nix（`/nix/var/nix/profiles/default/bin/nix`）を exec する。
+- shim の設定は、できるだけ**環境変数ではなく `nix.conf` で**渡す。`ensure.sh` が `/etc/nix/gh-shim.conf` を書き、`nix.conf` の**最後の行**に `!include /etc/nix/gh-shim.conf` を置く。後から読んだ設定が勝つので、ほかの場所（ベースイメージの nix-installer が書いた `nix.custom.conf` の `ssl-cert-file = /etc/ssl/certs/ca-certificates.crt` など）より優先される。ラッパーを通らない nix（絶対パスで呼んだ本物の nix、nix-daemon など）にも効く。
+  - `ssl-cert-file = /etc/nix/ca-bundle.pem`：Nix は `NIX_SSL_CERT_FILE` より `nix.conf` の `ssl-cert-file` を優先するので、環境変数だけでは効かない。
+  - `extra-access-tokens = github.com=gh-shim-dummy`：Nix はトークンがあるときだけ `api.github.com/.../tarball/...` を使う（ないと `github.com/.../archive/...` に行き、プロキシに 403 にされる）。shim はトークンの中身を見ない。
+- shim の自己署名 CA は **Nix だけが信頼する**（`/etc/nix/ca-bundle.pem` = エージェントプロキシの CA（`/root/.ccr/ca-bundle.crt`）+ システム CA + shim CA）。システムの信頼ストアには入れない。
+- `/root/.local/bin/nix`（`shim/nix-wrapper.sh`）は実行のたびに `/opt/gh-shim/ensure.sh` を呼び、次を直してから本物のコマンド（`/nix/var/nix/profiles/default/bin/<呼ばれた名前>`）を exec する。`nix-build` / `nix-shell` / `nix-env` / `nix-store` などの従来コマンドも、同じラッパーへのシンボリックリンクとして `/root/.local/bin` に置く。
   1. `/etc/hosts` の `127.0.0.1 api.github.com`（VM の復元で消える可能性がある）
-  2. `/etc/nix/ca-bundle.pem` の作り直し（プロキシの CA は入れ替わることがある）
-  3. shim の起動（環境のキャッシュにはプロセスが残らないので、セッションごとに起動し直す）
-- `no_proxy=api.github.com` は nix のプロセスにだけ設定する。`.bashrc` には書かないので、`gh` や `curl`、Claude の GitHub ツールはこれまでどおりプロキシを通る。
+  2. `/etc/nix/ca-bundle.pem` の作り直し（プロキシの CA は入れ替わることがある。中身が変わったときだけ書き換える）
+  3. `nix.conf` の `!include` と `/etc/nix/gh-shim.conf`（nix を入れ直した場合などに備える）
+  4. shim の起動（環境のキャッシュにはプロセスが残らないので、セッションごとに起動し直す）
+- ラッパーが先に見つかるよう、`/root/.local/bin` を PATH の先頭に置く。対話シェルと Claude の Bash ツールは `~/.bashrc`（home-manager）、ログインシェルは `/etc/profile.d/zz-gh-shim.sh` で行う。後者は home-manager が失敗しても効く。
+- `no_proxy=api.github.com` は nix のプロセスにだけ設定する（Nix の設定にはプロキシの項目がないので、これだけはラッパーでしか渡せない）。`.bashrc` には書かないので、`gh` や `curl`、Claude の GitHub ツールはこれまでどおりプロキシを通る。
 
 ### 限界
 
 - **取れるのは公開リポジトリ（とセッションにつないだリポジトリ）だけ。** shim は匿名 git で中身を取るため、非公開リポジトリの `github:` 入力は解決できない。このリポジトリ自体が公開なのもそのため。
 - **Nix が使う 2 つの API しか真似しない。** ほかのエンドポイントには 404 を返す。ただし、ラッパーの外では `/etc/hosts` に関係なくプロキシ経由になるので（プロキシがホスト名で接続する）、`gh` などには影響しない。
+- **絶対パスで本物の nix を呼ぶと `no_proxy` が付かない。** CA とトークンは `nix.conf` で効いているが、`api.github.com` へのリクエストがプロキシに行って 403 になる。PATH の `nix` を使えば問題ない。
 - `/etc/hosts` に `127.0.0.1 api.github.com` があるので、プロキシを使わずに `api.github.com` に直接つなぐプログラムは shim に当たる（shim の CA を信頼していないので TLS エラーになる）。
 - タグとブランチの解決は `git ls-remote` で行う。`github:owner/repo` のように ref を省くと `HEAD` を使う。
 
@@ -121,13 +126,14 @@ curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main
 
 `scripts/check.sh` が確認すること:
 
-1. `bash -lc` と `bash -ic` の両方で `which nix` が `/root/.local/bin/nix`
+1. `bash -lc` と `bash -ic` の両方で `which nix` が `/root/.local/bin/nix`（1b: `nix-build` / `nix-shell` も同様）
 2. `home.packages` のツール（fd, bat, eza, just, rg, jq）に PATH が通っている
 3. `home.sessionVariables`（`CLOUD_ENV_LINUX=1`, `EDITOR=vim`）が `bash -lc` と `bash -ic` の両方で見える
 4. shim を kill し、`/etc/hosts` の行を消しても `nix flake metadata github:nix-community/home-manager/release-26.05` が成功する（ラッパーの自動復旧）
 5. 同じ rev を `github:` と `git+https://` で `nix flake prefetch` したとき narHash が一致する
 6. `curl https://api.github.com/` が shim を通らない（証明書の発行者が gh-shim の CA ではない）、対話シェルの `no_proxy` に `api.github.com` がない
 7. 直近の `setup.sh` の所要時間（ログの `TOTAL`）が 5 分未満
+8. ラッパーを通さない本物の nix でも、`ssl-cert-file` が `/etc/nix/ca-bundle.pem`、`access-tokens` に `github.com=gh-shim-dummy` がある
 
 ログ: `/var/log/cloud-env-setup.log`（セットアップ）、`/var/log/gh-shim.log`（shim）
 
@@ -138,8 +144,9 @@ curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main
 ├── setup.sh              # エントリポイント（Setup script から curl | bash される）
 ├── shim/
 │   ├── shim.py           # api.github.com shim → /opt/gh-shim/shim.py
-│   ├── ensure.sh         # hosts / CA バンドル / shim 起動の確認 → /opt/gh-shim/ensure.sh
-│   └── nix-wrapper.sh    # → /root/.local/bin/nix
+│   ├── ensure.sh         # hosts / CA バンドル / nix.conf / shim 起動の確認 → /opt/gh-shim/ensure.sh
+│   ├── nix-wrapper.sh    # → /root/.local/bin/nix（nix-build などはここへのリンク）
+│   └── profile.sh        # → /etc/profile.d/zz-gh-shim.sh（ログインシェルの PATH）
 ├── flake.nix             # homeConfigurations.root と packages.home-manager
 ├── flake.lock
 ├── home/default.nix      # packages / sessionVariables / programs.*

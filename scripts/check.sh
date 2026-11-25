@@ -116,7 +116,9 @@ real_nix_conf() {
 }
 check "8. 本物の nix でも ssl-cert-file / access-tokens が shim 用" real_nix_conf
 
-if grep -q 'WARN: home-manager switch failed' "$LOG" 2>/dev/null; then
+# 直近のセットアップ（最後の開始行より後）だけを見る
+if awk '/cloud_environment_linux setup \(/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$LOG" 2>/dev/null \
+  | grep -q 'WARN: home-manager switch failed'; then
   echo "⚠️  $LOG に home-manager の失敗が記録されている"
 fi
 
