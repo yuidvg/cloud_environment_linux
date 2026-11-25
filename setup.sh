@@ -20,13 +20,19 @@ OWNER=${CLOUD_ENV_OWNER:-yuidvg}
 REPO=${CLOUD_ENV_REPO:-cloud_environment_linux}
 REF=${CLOUD_ENV_REF:-main}
 RAW="https://raw.githubusercontent.com/$OWNER/$REPO/$REF"
-FLAKE="github:$OWNER/$REPO/$REF"
+# ref に / を含むブランチ（claude/xxx など）は ?ref= で渡す
+case "$REF" in
+  */*) FLAKE="github:$OWNER/$REPO?ref=$REF" ;;
+  *) FLAKE="github:$OWNER/$REPO/$REF" ;;
+esac
 
 LOG=/var/log/cloud-env-setup.log
 SHIM_DIR=/opt/gh-shim
 REAL_NIX=/nix/var/nix/profiles/default/bin/nix
 NIX_PROFILE_SCRIPT=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 WRAPPER=/root/.local/bin/nix
+# ラッパーを通す従来コマンド（/root/.local/bin/<名前> -> nix ラッパー）
+LEGACY_CMDS="nix-build nix-shell nix-env nix-store nix-instantiate nix-prefetch-url nix-channel nix-collect-garbage nix-copy-closure nix-hash"
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -71,6 +77,12 @@ shim_setup() {
   fetch shim/ensure.sh "$SHIM_DIR/ensure.sh"
   fetch shim/nix-wrapper.sh "$WRAPPER"
   chmod +x "$SHIM_DIR/ensure.sh" "$WRAPPER"
+  local cmd
+  for cmd in $LEGACY_CMDS; do
+    ln -sfn nix "/root/.local/bin/$cmd"
+  done
+  # ログインシェルでもラッパーを本物の nix より前に置く（home-manager が失敗しても効く）
+  fetch shim/profile.sh /etc/profile.d/zz-gh-shim.sh
 
   # 自己署名 CA と api.github.com 用サーバー証明書（SAN 必須）。Nix だけが信頼する
   if [ ! -s "$SHIM_DIR/server.crt" ] || [ ! -s "$SHIM_DIR/ca.crt" ]; then
@@ -102,7 +114,9 @@ shim_setup() {
 # ---------------------------------------------------------------------------
 nix_install() {
   if [ -x "$REAL_NIX" ]; then
+    # ベースイメージに入っている nix など。nix.conf に shim の設定を足す
     log "nix already installed: $("$REAL_NIX" --version)"
+    "$SHIM_DIR/ensure.sh"
     return 0
   fi
 
@@ -118,16 +132,17 @@ nix_install() {
   [ -s "$installer" ] || { log "ERROR: could not download nix-installer"; return 1; }
 
   # --enable-flakes: 2.35.2 以降の nix-installer は既定で flakes を有効にしない
-  # access-tokens のダミー: これがないと Nix は github.com/.../archive/... を取りに行き shim を通らない
+  # access-tokens のダミーと ssl-cert-file の上書きは、インストール後の ensure.sh が
+  # nix.conf の最後に足す /etc/nix/gh-shim.conf で入れる
   NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
   sh "$installer" install linux \
     --init none \
     --no-confirm \
     --enable-flakes \
     --ssl-cert-file /etc/nix/ca-bundle.pem \
-    --extra-conf "sandbox = false" \
-    --extra-conf "access-tokens = github.com=gh-shim-dummy"
+    --extra-conf "sandbox = false"
   rm -f "$installer"
+  "$SHIM_DIR/ensure.sh"
 
   [ -x "$REAL_NIX" ] || { log "ERROR: $REAL_NIX not found after install"; return 1; }
   log "installed: $("$REAL_NIX" --version)"
