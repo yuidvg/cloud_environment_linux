@@ -4,14 +4,15 @@
 # クラウド環境の Setup script 欄から次のように呼ばれる:
 #   curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main/setup.sh | bash
 #
-#   1. shim setup         … api.github.com のローカル shim（github: 形式の flake 入力を通すため）
+#   1. shim setup         … api.github.com のローカル shim（github: 形式の flake 入力を通すため）と、
+#                           nix の通信だけを shim に回す intercept・SessionStart フックの登録
 #   2. nix install        … NixOS/nix-installer（linux プランナー / --init none）
 #   3. home-manager setup … この flake の homeConfigurations.root を switch
 #
 # 失敗の扱い:
 #   - shim / nix の失敗は非ゼロで終了する（セッションが起動しないので必ず気づける）
 #   - home-manager の失敗は WARN をログに残してゼロで終了する（設定ミスでセッション自体が
-#     使えなくなるのを避ける。nix とラッパーは使えるので、セッション内で直して switch できる）
+#     使えなくなるのを避ける。nix と shim は使えるので、セッション内で直して switch できる）
 set -euo pipefail
 
 export USER=root HOME=/root
@@ -30,9 +31,9 @@ LOG=/var/log/cloud-env-setup.log
 SHIM_DIR=/opt/gh-shim
 REAL_NIX=/nix/var/nix/profiles/default/bin/nix
 NIX_PROFILE_SCRIPT=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-WRAPPER=/root/.local/bin/nix
-# ラッパーを通す従来コマンド（/root/.local/bin/<名前> -> nix ラッパー）
-LEGACY_CMDS="nix-build nix-shell nix-env nix-store nix-instantiate nix-prefetch-url nix-channel nix-collect-garbage nix-copy-closure nix-hash"
+CLAUDE_SETTINGS=/root/.claude/settings.json
+# 以前の版が置いていた nix ラッパー（/root/.local/bin/<名前>）。見つけたら消す
+OLD_WRAPPER_CMDS="nix nix-build nix-shell nix-env nix-store nix-instantiate nix-prefetch-url nix-channel nix-collect-garbage nix-copy-closure nix-hash"
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -71,18 +72,17 @@ fetch() { # fetch <repo-relative path> <dest>
 # 1. shim setup（nix-installer に --ssl-cert-file を渡すので、先に CA バンドルを作る）
 # ---------------------------------------------------------------------------
 shim_setup() {
-  mkdir -p "$SHIM_DIR" /var/cache/gh-shim /root/.local/bin
+  mkdir -p "$SHIM_DIR" /var/cache/gh-shim
 
-  fetch shim/shim.py "$SHIM_DIR/shim.py"
-  fetch shim/ensure.sh "$SHIM_DIR/ensure.sh"
-  fetch shim/nix-wrapper.sh "$WRAPPER"
-  chmod +x "$SHIM_DIR/ensure.sh" "$WRAPPER"
-  local cmd
-  for cmd in $LEGACY_CMDS; do
-    ln -sfn nix "/root/.local/bin/$cmd"
+  local f
+  for f in shim.py intercept.py ensure.sh supervise.sh; do
+    fetch "shim/$f" "$SHIM_DIR/$f"
   done
-  # ログインシェルでもラッパーを本物の nix より前に置く（home-manager が失敗しても効く）
+  chmod +x "$SHIM_DIR/ensure.sh" "$SHIM_DIR/supervise.sh"
+  # ログインシェルでも nix のプロファイルを読む
   fetch shim/profile.sh /etc/profile.d/zz-gh-shim.sh
+  remove_old_wrapper
+  register_session_hook
 
   # 自己署名 CA と api.github.com 用サーバー証明書（SAN 必須）。Nix だけが信頼する
   if [ ! -s "$SHIM_DIR/server.crt" ] || [ ! -s "$SHIM_DIR/ca.crt" ]; then
@@ -101,12 +101,48 @@ shim_setup() {
     )
   fi
 
-  # 毎回: hosts / CA バンドル再生成 / shim 起動
+  # 毎回: hosts / CA バンドル再生成 / shim・intercept 起動 / iptables
   "$SHIM_DIR/ensure.sh"
   if ! (exec 3<>/dev/tcp/127.0.0.1/443) 2>/dev/null; then
     log "ERROR: gh-shim did not start (see /var/log/gh-shim.log)"
     return 1
   fi
+}
+
+# 以前の版の nix ラッパー（中身に gh-shim を含むものだけ）を消す
+remove_old_wrapper() {
+  local cmd p
+  for cmd in $OLD_WRAPPER_CMDS; do
+    p=/root/.local/bin/$cmd
+    if [ -L "$p" ] && [ "$(readlink "$p")" = nix ]; then
+      rm -f "$p"
+    elif [ -f "$p" ] && grep -q gh-shim "$p" 2>/dev/null; then
+      rm -f "$p"
+    fi
+  done
+}
+
+# Claude Code の SessionStart フック（セッション開始・再開のたび）で ensure.sh を呼ぶ。
+# エージェントプロキシのポートはセッションごとに変わるので、iptables はここで入れ直す
+register_session_hook() {
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  python3 - "$CLAUDE_SETTINGS" "$SHIM_DIR/ensure.sh" <<'PY'
+import json, os, sys
+path, cmd = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+groups = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+if not any(h.get("command") == cmd for g in groups for h in g.get("hooks", [])):
+    groups.append({"matcher": "", "hooks": [{"type": "command", "command": cmd}]})
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -154,21 +190,24 @@ nix_install() {
 home_manager_setup() {
   # shellcheck disable=SC1090
   [ -r "$NIX_PROFILE_SCRIPT" ] && . "$NIX_PROFILE_SCRIPT"
-  export PATH=/root/.local/bin:$PATH
+  # Setup script の時点では、セッションのエージェントプロキシ（と iptables の付け替え）が
+  # まだない可能性がある。このコマンドに限り api.github.com をプロキシから外し、
+  # /etc/hosts で shim に直接つなぐ
+  export no_proxy="${no_proxy:+$no_proxy,}api.github.com"
+  export NO_PROXY="${NO_PROXY:+$NO_PROXY,}api.github.com"
 
   # home-manager 本体も flake.lock で固定したものを使う（release ブランチの最新を毎回取らない）
-  "$WRAPPER" run --refresh "$FLAKE#home-manager" -- \
+  "$REAL_NIX" run --refresh "$FLAKE#home-manager" -- \
     switch --flake "$FLAKE#root" -b bak
 }
 
-# home-manager が失敗したときでも、最低限 nix（ラッパー）が Claude の Bash から見えるようにする
+# home-manager が失敗したときでも、最低限 nix が Claude の Bash から見えるようにする
 bashrc_fallback() {
   [ -L /root/.bashrc ] && return 0 # home-manager 管理下なら触らない
   grep -q 'cloud_environment_linux fallback' /root/.bashrc 2>/dev/null && return 0
   cat >> /root/.bashrc <<EOF
 # >>> cloud_environment_linux fallback (home-manager switch failed) >>>
 [ -r $NIX_PROFILE_SCRIPT ] && . $NIX_PROFILE_SCRIPT
-export PATH=/root/.local/bin:\$PATH
 # <<< cloud_environment_linux fallback <<<
 EOF
   log "wrote fallback PATH setup to /root/.bashrc"

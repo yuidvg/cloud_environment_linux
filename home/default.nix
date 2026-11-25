@@ -26,7 +26,7 @@
 
   programs.home-manager.enable = true;
 
-  # Claude の Bash ツールからも nix（ラッパー）と環境変数が見えるよう .bashrc で読み込む。
+  # Claude の Bash ツールからも nix と環境変数が見えるよう .bashrc で読み込む。
   # bashrcExtra は非対話シェルでも実行される位置（interactive ガードより前）に入る。
   programs.bash = {
     enable = true;
@@ -37,9 +37,6 @@
       fi
       # home.sessionVariables（プロファイルの場所に依存しないよう store パスで直接読む）
       . "${config.home.sessionVariablesPackage}/etc/profile.d/hm-session-vars.sh"
-      # gh-shim 付きの nix ラッパーを本物の nix より前に置く
-      # （すでに PATH にあっても nix のパスより後ろの可能性があるので、常に先頭に足す）
-      export PATH="/root/.local/bin:$PATH"
     '';
   };
 

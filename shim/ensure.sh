@@ -1,21 +1,31 @@
 #!/bin/bash
-# gh-shim の前提を毎回そろえる（冪等）。/opt/gh-shim/ensure.sh として置かれ、
-# setup.sh と nix ラッパーの両方から呼ばれる。
-#   1. /etc/hosts に 127.0.0.1 api.github.com（VM の復元で消える可能性がある）
+# gh-shim の前提をそろえる（冪等）。/opt/gh-shim/ensure.sh として置かれ、
+# setup.sh と Claude Code の SessionStart フック（セッション開始・再開のたび）から呼ばれる。
+#   1. /etc/hosts に 127.0.0.1 api.github.com（プロキシを使わない nix 用。VM の復元で消えうる）
 #   2. /etc/nix/ca-bundle.pem をプロキシ CA + システム CA + shim CA で作り直す
 #      （プロキシの CA は入れ替わることがある）
 #   3. nix.conf の最後で /etc/nix/gh-shim.conf を読ませる（ssl-cert-file / access-tokens）。
-#      環境変数ではなく設定ファイルで渡すので、ラッパーを通らない nix
-#      （ベースイメージに入っている nix、nix-daemon、home-manager が呼ぶ nix など）にも効く。
 #      nix.custom.conf などに ssl-cert-file があっても、最後に読むこちらが勝つ
-#   4. shim が動いていなければ起動し、ポートが開くまで待つ
+#   4. shim（127.0.0.1:443）と intercept（127.0.0.1:18443）を supervise.sh 付きで起動する
+#   5. iptables: エージェントプロキシ（HTTPS_PROXY のポート）宛ての接続を intercept へ付け替える。
+#      プロキシのポートはセッションごとに変わるので毎回入れ直す。intercept は nix の
+#      CONNECT api.github.com だけを shim に回し、それ以外はそのまま元のプロキシへ流す
 # shim の CA はシステムの信頼ストアには入れない（Nix だけが信頼する）。
+# 標準出力は SessionStart フックだと Claude の文脈に入るので、何も出さない。
+exec >>/var/log/gh-shim.log 2>&1
 
-SHIM_CA=/opt/gh-shim/ca.crt
+DIR=/opt/gh-shim
+SHIM_CA=$DIR/ca.crt
 BUNDLE=/etc/nix/ca-bundle.pem
 NIX_CONF=/etc/nix/nix.conf
 SHIM_CONF=/etc/nix/gh-shim.conf
 INCLUDE_LINE="!include $SHIM_CONF"
+INTERCEPT_PORT=18443
+MARK=0x6768
+CHAIN=GH_SHIM
+
+log() { printf '[%s] ensure: %s\n' "$(date '+%F %T')" "$*"; }
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 # 1. hosts
 grep -q '^127\.0\.0\.1 api\.github\.com$' /etc/hosts 2>/dev/null \
@@ -46,12 +56,43 @@ if [ -f "$NIX_CONF" ] && [ "$(tail -n1 "$NIX_CONF")" != "$INCLUDE_LINE" ]; then
     && mv -f "$NIX_CONF.tmp.$$" "$NIX_CONF"
 fi
 
-# 4. shim プロセス
-if ! (exec 3<>/dev/tcp/127.0.0.1/443) 2>/dev/null; then
-  nohup python3 /opt/gh-shim/shim.py >>/var/log/gh-shim.log 2>&1 </dev/null &
+# 4. shim / intercept（落ちても supervise.sh が起動し直す）
+start() { # start <name> <port> <command...>
+  local name=$1 port=$2
+  shift 2
+  if ! pgrep -f "supervise.sh $name " >/dev/null; then
+    log "starting $name"
+    setsid nohup "$DIR/supervise.sh" "$name" "$@" >/dev/null 2>&1 </dev/null &
+  fi
   for _ in $(seq 50); do
-    (exec 3<>/dev/tcp/127.0.0.1/443) 2>/dev/null && break
+    port_open "$port" && return 0
     sleep 0.1
   done
+  log "WARN: $name is not listening on $port"
+  return 1
+}
+start shim 443 python3 "$DIR/shim.py"
+intercept_ok=0
+start intercept "$INTERCEPT_PORT" python3 "$DIR/intercept.py" && intercept_ok=1
+
+# 5. iptables（intercept が待ち受けているときだけ。止まっていると全通信が止まるので）
+proxy=${HTTPS_PROXY:-${https_proxy:-}}
+if [[ $proxy =~ ^https?://127\.0\.0\.1:([0-9]+)/?$ ]] && command -v iptables >/dev/null; then
+  port=${BASH_REMATCH[1]}
+  rule="-A $CHAIN -d 127.0.0.1/32 -p tcp -m tcp --dport $port -m mark ! --mark $MARK -j REDIRECT --to-ports $INTERCEPT_PORT"
+  iptables -t nat -N "$CHAIN" 2>/dev/null
+  iptables -t nat -C OUTPUT -j "$CHAIN" 2>/dev/null || iptables -t nat -A OUTPUT -j "$CHAIN"
+  if [ "$intercept_ok" = 1 ]; then
+    if ! iptables -t nat -S "$CHAIN" | grep -qxF -- "$rule"; then
+      iptables -t nat -F "$CHAIN"
+      # shellcheck disable=SC2086
+      iptables -t nat $rule && log "redirecting 127.0.0.1:$port -> intercept :$INTERCEPT_PORT"
+    fi
+  else
+    iptables -t nat -F "$CHAIN"
+    log "WARN: intercept down; iptables redirect removed"
+  fi
+else
+  log "no loopback HTTPS_PROXY (${proxy:-unset}); iptables redirect not installed"
 fi
 exit 0
