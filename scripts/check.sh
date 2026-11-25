@@ -35,15 +35,15 @@ done
 check "1. 呼び出し元の環境: nix が PATH にある" bash -c 'command -v nix >/dev/null'
 
 # 2. home.packages のツールに PATH が通っている
-for tool in fd bat eza just rg jq; do
+for tool in fd bat eza just rg jq meguri; do
   check "2. bash -lc / -ic: $tool が PATH にある" \
     bash -c "bash -lc 'command -v $tool' >/dev/null 2>&1 && bash -ic 'command -v $tool' >/dev/null 2>&1"
 done
 
 # 3. home.sessionVariables が見える
 for mode in -lc -ic; do
-  check "3. bash $mode: CLOUD_ENV_LINUX=1 / EDITOR=vim" \
-    bash -c "[ \"\$(bash $mode 'echo \$CLOUD_ENV_LINUX:\$EDITOR' 2>/dev/null | tail -n1)\" = '1:vim' ]"
+  check "3. bash $mode: CLOUD_ENV_LINUX=1 / EDITOR=vim / LANG=C.UTF-8" \
+    bash -c "[ \"\$(bash $mode 'echo \$CLOUD_ENV_LINUX:\$EDITOR:\$LANG' 2>/dev/null | tail -n1)\" = '1:vim:C.UTF-8' ]"
 done
 
 # fetch_ok <nix> : --refresh で github: を取り、403 の警告（＝キャッシュへの退避）がないことを確かめる

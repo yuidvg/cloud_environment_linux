@@ -140,8 +140,8 @@ curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main
 `scripts/check.sh` が確認すること:
 
 1. `bash -lc`・`bash -ic`・呼び出し元（Claude の Bash ツール）のどれでも `nix` が PATH にある
-2. `home.packages` のツール（fd, bat, eza, just, rg, jq）に PATH が通っている
-3. `home.sessionVariables`（`CLOUD_ENV_LINUX=1`, `EDITOR=vim`）が `bash -lc` と `bash -ic` の両方で見える
+2. `home.packages` のツール（fd, bat, eza, just, rg, jq, meguri）に PATH が通っている
+3. `home.sessionVariables`（`CLOUD_ENV_LINUX=1`, `EDITOR=vim`, `LANG=C.UTF-8`）が `bash -lc` と `bash -ic` の両方で見える
 4. shim を kill し、`/etc/hosts` の行を消しても、`ensure.sh`（SessionStart フックと同じもの）で直り、`--refresh` 付きで `github:` を取れる
 5. 同じ rev を `github:` と `git+https://` で `nix flake prefetch` したとき narHash が一致する
 6. `curl https://api.github.com/` が shim を通らない（証明書の発行者が gh-shim の CA ではない）、対話シェルの `no_proxy` に `api.github.com` がない
@@ -163,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/yuidvg/cloud_environment_linux/main
 │   ├── supervise.sh      # shim / intercept が落ちたら起動し直す → /opt/gh-shim/supervise.sh
 │   ├── ensure.sh         # hosts / CA / nix.conf / プロセス / iptables → /opt/gh-shim/ensure.sh（SessionStart フック）
 │   └── profile.sh        # → /etc/profile.d/zz-gh-shim.sh（ログインシェルで nix のプロファイルを読む）
-├── flake.nix             # homeConfigurations.root と packages.home-manager
+├── flake.nix             # homeConfigurations.root と packages.home-manager（入力に meguri）
 ├── flake.lock
 ├── home/default.nix      # packages / sessionVariables / programs.*
 ├── scripts/check.sh      # 受け入れテスト

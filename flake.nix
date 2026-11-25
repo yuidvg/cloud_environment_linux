@@ -8,10 +8,12 @@
       url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # 購入調査の CLI。nixpkgs は follows しない（meguri 自身の flake.lock でビルドとテストを確かめている）
+    meguri.url = "github:yuidvg/meguri";
   };
 
   outputs =
-    { nixpkgs, home-manager, ... }:
+    inputs@{ nixpkgs, home-manager, ... }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -20,6 +22,7 @@
       homeConfigurations.root = home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         modules = [ ./home ];
+        extraSpecialArgs = { inherit inputs; };
       };
 
       # setup.sh は `nix run <this flake>#home-manager` で lock に固定した home-manager を使う
