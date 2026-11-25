@@ -32,6 +32,12 @@ for mode in -lc -ic; do
     bash -c "[ \"\$(bash $mode 'which nix' 2>/dev/null | tail -n1)\" = '$WRAPPER' ]"
 done
 
+# 1b. 従来コマンド（nix-build など）もラッパーを指す
+for mode in -lc -ic; do
+  check "1b. bash $mode: which nix-build / nix-shell = /root/.local/bin/..." \
+    bash -c "[ \"\$(bash $mode 'which nix-build; which nix-shell' 2>/dev/null | tail -n2 | tr '\n' ' ')\" = '/root/.local/bin/nix-build /root/.local/bin/nix-shell ' ]"
+done
+
 # 2. home.packages のツールに PATH が通っている
 for tool in fd bat eza just rg jq; do
   check "2. bash -lc / -ic: $tool が PATH にある" \
@@ -100,7 +106,19 @@ setup_time() {
 }
 check "7. setup.sh の所要時間 < 300s" setup_time
 
-if grep -q 'WARN: home-manager switch failed' "$LOG" 2>/dev/null; then
+# 8. ラッパーを通らない本物の nix にも shim の設定が効いている（nix.conf 経由）
+real_nix_conf() {
+  local real=/nix/var/nix/profiles/default/bin/nix cert tokens
+  cert=$(env -u NIX_SSL_CERT_FILE "$real" config show ssl-cert-file 2>&1)
+  tokens=$("$real" config show access-tokens 2>&1)
+  echo "ssl-cert-file=$cert access-tokens=$tokens"
+  [ "$cert" = /etc/nix/ca-bundle.pem ] && echo "$tokens" | grep -q 'github.com=gh-shim-dummy'
+}
+check "8. 本物の nix でも ssl-cert-file / access-tokens が shim 用" real_nix_conf
+
+# 直近のセットアップ（最後の開始行より後）だけを見る
+if awk '/cloud_environment_linux setup \(/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$LOG" 2>/dev/null \
+  | grep -q 'WARN: home-manager switch failed'; then
   echo "⚠️  $LOG に home-manager の失敗が記録されている"
 fi
 
